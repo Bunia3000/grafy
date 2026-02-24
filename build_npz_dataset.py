@@ -1,3 +1,6 @@
+# python dataset/build_npz_dataset.py --input "C:\Users\danil\.vscode\grafy\dataset\grafyzexela" --output "C:\Users\danil\.vscode\grafy\dataset\grafs-dataset" --L 101
+#
+#
 # build_npz_dataset.py
 # Converts your .xyz graph files into per-graph .npz files with canonical XYZ preprocessing.
 #
@@ -374,3 +377,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
