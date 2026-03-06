@@ -1,0 +1,454 @@
+# train_loops9_2classes.py
+# Baseline training on loop-graphs (X-loops):
+# - reads .npz from: <dataset_root>/npz/<class_label>/*.npz
+# - expects X shape: (3, Lloop, 3)
+# - reshapes to (Lloop, 9) = concat xyz of 3 loops as features
+# - trains ONLY on two classes (default: 3_1 and 4_1) with balancing
+#
+# Added:
+# - --lr (default 0.001)
+# - confusion matrix + precision/recall/f1 + predictions.csv
+# - run_summary.json for comparing experiments
+# - save train/val/test file lists for reproducibility
+#
+# Recommended run:
+#   python ...\train_loops9_2classes.py --net RNN2b --epochs 15 --lr 0.001 --bs 64
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import tensorflow as tf
+
+
+# --- Make sure we can import your project modules from src/ ---
+THIS_FILE = Path(__file__).resolve()
+PROJECT_ROOT = THIS_FILE.parents[1]  # ...\grafy
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+# Reuse your existing model builders from src/models.py
+from models import setup_RNN, setup_RNN2, setup_RNN2b, setup_NN2  # noqa: E402
+
+
+def list_class_files(npz_root: Path, class_label: str) -> List[Path]:
+    class_dir = npz_root / class_label
+    if not class_dir.exists():
+        raise FileNotFoundError(f"Class folder not found: {class_dir}")
+    files = sorted(class_dir.glob("*.npz"))
+    if not files:
+        raise RuntimeError(f"No .npz files found in: {class_dir}")
+    return files
+
+
+def balanced_two_class_subset(
+    npz_root: Path,
+    classes: Tuple[str, str],
+    cap: int,
+    seed: int,
+) -> Tuple[List[Path], int]:
+    """
+    Returns:
+      files: balanced list of files (shuffled)
+      effective_cap: actual cap used = min(cap, len(class1), len(class2))
+    """
+    c1, c2 = classes
+    f1 = list_class_files(npz_root, c1)
+    f2 = list_class_files(npz_root, c2)
+
+    effective_cap = min(cap, len(f1), len(f2))
+
+    rng = random.Random(seed)
+    rng.shuffle(f1)
+    rng.shuffle(f2)
+
+    f1 = f1[:effective_cap]
+    f2 = f2[:effective_cap]
+
+    files = f1 + f2
+    rng.shuffle(files)
+    print(f"Balanced subset: {c1}={len(f1)}  {c2}={len(f2)}  (cap={cap} -> effective_cap={effective_cap})")
+    return files, effective_cap
+
+
+def split_files(
+    files: List[Path],
+    seed: int,
+    train_frac: float = 0.8,
+    val_frac: float = 0.1,
+) -> Tuple[List[Path], List[Path], List[Path]]:
+    rng = random.Random(seed)
+    files = files.copy()
+    rng.shuffle(files)
+
+    n = len(files)
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+    train = files[:n_train]
+    val = files[n_train:n_train + n_val]
+    test = files[n_train + n_val:]
+    return train, val, test
+
+
+def np_load_loops9(path_bytes: bytes, class_to_id: Dict[str, int], expected_L: int | None):
+    path = Path(path_bytes.decode("utf-8"))
+
+    class_label = path.parent.name
+    if class_label not in class_to_id:
+        raise ValueError(f"Unknown class_label={class_label} for file={path}")
+
+    d = np.load(str(path), allow_pickle=True)
+    if "X" not in d:
+        raise ValueError(f"Missing 'X' in {path}")
+
+    X = d["X"].astype(np.float32)  # (3,L,3)
+    if X.ndim != 3 or X.shape[0] != 3 or X.shape[2] != 3:
+        raise ValueError(f"Bad X shape {X.shape} in {path}; expected (3,L,3)")
+
+    L = int(d["L"]) if "L" in d else int(X.shape[1])
+    if expected_L is not None and L != expected_L:
+        raise ValueError(f"Unexpected L={L} in {path}; expected {expected_L}")
+
+    # (3,L,3) -> (L, 9)
+    X9 = np.transpose(X, (1, 0, 2)).reshape((L, 9)).astype(np.float32)
+
+    y = np.int64(class_to_id[class_label])
+    return X9, y
+
+
+def make_tf_dataset(
+    files: List[Path],
+    class_to_id: Dict[str, int],
+    expected_L: int | None,
+    bs: int,
+    shuffle: bool,
+    seed: int,
+) -> tf.data.Dataset:
+    paths = tf.constant([str(p) for p in files])
+    ds = tf.data.Dataset.from_tensor_slices(paths)
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(files), seed=seed, reshuffle_each_iteration=True)
+
+    def _map_fn(p):
+        X9, y = tf.numpy_function(
+            func=lambda pb: np_load_loops9(pb, class_to_id, expected_L),
+            inp=[p],
+            Tout=[tf.float32, tf.int64],
+        )
+        if expected_L is not None:
+            X9.set_shape((expected_L, 9))
+        else:
+            X9.set_shape((None, 9))
+        y.set_shape(())
+        return X9, y
+
+    ds = ds.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(bs).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+def build_model(
+    net: str,
+    input_shape: tuple[int, int],
+    n_classes: int,
+    norm: bool,
+    lr: float,
+) -> tf.keras.Model:
+    opt = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    if net == "RNN":
+        return setup_RNN(input_shape, n_classes, "tanh", opt, norm)
+    if net == "RNN2":
+        return setup_RNN2(input_shape, n_classes, "tanh", opt, norm)
+    if net == "RNN2b":
+        return setup_RNN2b(input_shape, n_classes, "tanh", opt, norm)
+    if net == "FFNN2":
+        # Keep consistent: use the same lr
+        return setup_NN2(input_shape, n_classes, "relu", opt, norm)
+
+    raise ValueError(f"Unknown net={net}. Choose from: RNN, RNN2, RNN2b, FFNN2")
+
+
+# ------------------------ metrics helpers ------------------------
+
+def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> np.ndarray:
+    cm = np.zeros((n_classes, n_classes), dtype=np.int64)
+    for t, p in zip(y_true, y_pred):
+        cm[int(t), int(p)] += 1
+    return cm
+
+
+def precision_recall_f1_from_cm(cm: np.ndarray) -> dict:
+    n_classes = cm.shape[0]
+    per_class = []
+    supports = cm.sum(axis=1)
+
+    for k in range(n_classes):
+        tp = int(cm[k, k])
+        fp = int(cm[:, k].sum() - tp)
+        fn = int(cm[k, :].sum() - tp)
+
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+
+        per_class.append({
+            "class": int(k),
+            "precision": float(prec),
+            "recall": float(rec),
+            "f1": float(f1),
+            "support": int(supports[k]),
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+        })
+
+    macro_p = float(np.mean([d["precision"] for d in per_class]))
+    macro_r = float(np.mean([d["recall"] for d in per_class]))
+    macro_f1 = float(np.mean([d["f1"] for d in per_class]))
+
+    total = float(np.sum(supports)) if np.sum(supports) > 0 else 1.0
+    weighted_p = float(np.sum([d["precision"] * d["support"] for d in per_class]) / total)
+    weighted_r = float(np.sum([d["recall"] * d["support"] for d in per_class]) / total)
+    weighted_f1 = float(np.sum([d["f1"] * d["support"] for d in per_class]) / total)
+
+    return {
+        "per_class": per_class,
+        "macro": {"precision": macro_p, "recall": macro_r, "f1": macro_f1},
+        "weighted": {"precision": weighted_p, "recall": weighted_r, "f1": weighted_f1},
+    }
+
+
+def evaluate_and_save_metrics(
+    model: tf.keras.Model,
+    test_ds: tf.data.Dataset,
+    out_dir: Path,
+    id_to_class: Dict[int, str],
+) -> dict:
+    y_true_all = []
+    y_pred_all = []
+
+    for Xb, yb in test_ds:
+        probs = model.predict(Xb, verbose=0)
+        pred = np.argmax(probs, axis=1).astype(np.int64)
+        y_true_all.append(yb.numpy().astype(np.int64))
+        y_pred_all.append(pred)
+
+    y_true = np.concatenate(y_true_all, axis=0)
+    y_pred = np.concatenate(y_pred_all, axis=0)
+
+    n_classes = len(id_to_class)
+    cm = compute_confusion_matrix(y_true, y_pred, n_classes=n_classes)
+    stats = precision_recall_f1_from_cm(cm)
+
+    # confusion_matrix.csv
+    cm_path = out_dir / "confusion_matrix.csv"
+    with cm_path.open("w", encoding="utf-8") as f:
+        f.write("true\\pred," + ",".join(id_to_class[i] for i in range(n_classes)) + "\n")
+        for i in range(n_classes):
+            row = ",".join(str(int(x)) for x in cm[i])
+            f.write(f"{id_to_class[i]},{row}\n")
+
+    # classification_report.txt
+    report_path = out_dir / "classification_report.txt"
+    with report_path.open("w", encoding="utf-8") as f:
+        f.write("Per-class metrics:\n")
+        for d in stats["per_class"]:
+            name = id_to_class[d["class"]]
+            f.write(
+                f"- {name:>6}  precision={d['precision']:.4f}  recall={d['recall']:.4f}  "
+                f"f1={d['f1']:.4f}  support={d['support']}  tp={d['tp']} fp={d['fp']} fn={d['fn']}\n"
+            )
+        f.write("\nMacro avg:\n")
+        f.write(
+            f"precision={stats['macro']['precision']:.4f}  recall={stats['macro']['recall']:.4f}  "
+            f"f1={stats['macro']['f1']:.4f}\n"
+        )
+        f.write("\nWeighted avg:\n")
+        f.write(
+            f"precision={stats['weighted']['precision']:.4f}  recall={stats['weighted']['recall']:.4f}  "
+            f"f1={stats['weighted']['f1']:.4f}\n"
+        )
+
+    # predictions.csv
+    pred_path = out_dir / "predictions.csv"
+    with pred_path.open("w", encoding="utf-8") as f:
+        f.write("y_true_id,y_true_label,y_pred_id,y_pred_label\n")
+        for t, p in zip(y_true, y_pred):
+            f.write(f"{int(t)},{id_to_class[int(t)]},{int(p)},{id_to_class[int(p)]}\n")
+
+    print(f"\nSaved metrics:")
+    print(f"- {cm_path}")
+    print(f"- {report_path}")
+    print(f"- {pred_path}")
+    print("\nConfusion matrix:\n", cm)
+
+    return {
+        "y_true": y_true.tolist(),
+        "y_pred": y_pred.tolist(),
+        "confusion_matrix": cm.tolist(),
+        "metrics": stats,
+    }
+
+
+def save_file_list(paths: List[Path], out_path: Path) -> None:
+    with out_path.open("w", encoding="utf-8") as f:
+        for p in paths:
+            f.write(str(p) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", required=True, help="Root folder containing npz/ (e.g. X-loops)")
+    ap.add_argument("--classes", nargs=2, default=["3_1", "4_1"], help="Two class labels to train on (e.g. 3_1 4_1)")
+    ap.add_argument("--cap", type=int, default=695, help="Max files per class before balancing (default 695)")
+
+    # Recommended defaults:
+    ap.add_argument("--net", default="RNN2b", help="RNN | RNN2 | RNN2b | FFNN2")
+    ap.add_argument("--epochs", type=int, default=15)
+    ap.add_argument("--lr", type=float, default=0.001, help="Adam learning rate (default 0.001)")
+    ap.add_argument("--bs", type=int, default=64)
+
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--expected_L", type=int, default=201, help="Expected loop length (use 201 for your loops)")
+    ap.add_argument("--norm", action="store_true", help="Enable BatchNorm in model (if supported)")
+    ap.add_argument("--out", default=str(PROJECT_ROOT / "results" / "loops9_2class"), help="Output folder for saved model")
+
+    args = ap.parse_args()
+
+    # CPU-friendly threading (tune if you want)
+    tf.config.threading.set_inter_op_parallelism_threads(4)
+    tf.config.threading.set_intra_op_parallelism_threads(4)
+
+    root = Path(args.dataset)
+    npz_root = root / "npz"
+    if not npz_root.exists():
+        raise FileNotFoundError(f"Cannot find npz/ at: {npz_root}")
+
+    c1, c2 = args.classes[0], args.classes[1]
+    files, effective_cap = balanced_two_class_subset(npz_root, (c1, c2), cap=args.cap, seed=args.seed)
+
+    class_to_id = {c1: 0, c2: 1}
+    id_to_class = {0: c1, 1: c2}
+
+    train_files, val_files, test_files = split_files(files, seed=args.seed, train_frac=0.8, val_frac=0.1)
+
+    print(f"\nDataset: {root}")
+    print(f"Classes: {[c1, c2]} (mapped: {class_to_id})")
+    print(f"Files: total={len(files)} train={len(train_files)} val={len(val_files)} test={len(test_files)}")
+    print(f"Input shape: (L,9) with L={args.expected_L}")
+    print(f"Train config: net={args.net} epochs={args.epochs} bs={args.bs} lr={args.lr} seed={args.seed}")
+
+    train_ds = make_tf_dataset(train_files, class_to_id, args.expected_L, args.bs, shuffle=True, seed=args.seed)
+    val_ds = make_tf_dataset(val_files, class_to_id, args.expected_L, args.bs, shuffle=False, seed=args.seed)
+    test_ds = make_tf_dataset(test_files, class_to_id, args.expected_L, args.bs, shuffle=False, seed=args.seed)
+
+    input_shape = (args.expected_L, 9)
+    model = build_model(args.net, input_shape, n_classes=2, norm=args.norm, lr=args.lr)
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save splits for reproducibility
+    save_file_list(train_files, out_dir / "train_files.txt")
+    save_file_list(val_files, out_dir / "val_files.txt")
+    save_file_list(test_files, out_dir / "test_files.txt")
+
+    ckpt_path = str(out_dir / "best_model")
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, min_delta=1e-3),
+        tf.keras.callbacks.ModelCheckpoint(filepath=ckpt_path, save_best_only=True, monitor="val_loss"),
+    ]
+
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=args.epochs,
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    print("\nEvaluating on test set:")
+    eval_out = model.evaluate(test_ds, verbose=1)
+    # model.evaluate returns list: [loss, acc] typically
+    test_loss = float(eval_out[0]) if isinstance(eval_out, (list, tuple)) else float(eval_out)
+    test_acc = float(eval_out[1]) if isinstance(eval_out, (list, tuple)) and len(eval_out) > 1 else float("nan")
+
+    metrics_blob = evaluate_and_save_metrics(model, test_ds, out_dir, id_to_class)
+
+    # Save final model
+    final_path = out_dir / "final_model"
+    model.save(str(final_path))
+    print(f"\nSaved final model to: {final_path}")
+
+    # Save class map
+    map_path = out_dir / "class_to_id.txt"
+    with map_path.open("w", encoding="utf-8") as f:
+        f.write(f"0\t{c1}\n")
+        f.write(f"1\t{c2}\n")
+    print(f"Saved class_to_id map to: {map_path}")
+
+    # Save run summary JSON
+    summary = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "dataset_root": str(root),
+        "npz_root": str(npz_root),
+        "classes": [c1, c2],
+        "cap_requested": int(args.cap),
+        "cap_effective": int(effective_cap),
+        "splits": {
+            "train": len(train_files),
+            "val": len(val_files),
+            "test": len(test_files),
+        },
+        "input": {
+            "expected_L": int(args.expected_L),
+            "features_per_step": 9,
+        },
+        "train_config": {
+            "net": args.net,
+            "epochs": int(args.epochs),
+            "batch_size": int(args.bs),
+            "lr": float(args.lr),
+            "seed": int(args.seed),
+            "norm": bool(args.norm),
+        },
+        "results": {
+            "test_loss": test_loss,
+            "test_accuracy": test_acc,
+            "confusion_matrix": metrics_blob["confusion_matrix"],
+            "metrics": metrics_blob["metrics"],
+        },
+        # Optional: store training curves (compact)
+        "history": {
+            k: [float(x) for x in v] for k, v in history.history.items()
+        },
+        "artifacts": {
+            "final_model": str(final_path),
+            "best_model": str(out_dir / "best_model"),
+            "class_to_id": str(map_path),
+            "confusion_matrix_csv": str(out_dir / "confusion_matrix.csv"),
+            "classification_report": str(out_dir / "classification_report.txt"),
+            "predictions_csv": str(out_dir / "predictions.csv"),
+            "train_files": str(out_dir / "train_files.txt"),
+            "val_files": str(out_dir / "val_files.txt"),
+            "test_files": str(out_dir / "test_files.txt"),
+        }
+    }
+
+    summary_path = out_dir / "run_summary.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"Saved run summary to: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()

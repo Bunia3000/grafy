@@ -1,0 +1,12 @@
+
+import numpy as np
+from pathlib import Path
+root = Path(r"C:\Users\danil\.vscode\grafy\dataset\StA\3_1")
+rows=[]
+for p in root.glob("*.npz"):
+    d=np.load(p)
+    A=d["StA"].astype(np.float32)
+    rows.append((float(A.max()), str(p)))
+rows.sort(reverse=True)
+for m,p in rows[:5]:
+    print(m, p)

@@ -1,0 +1,25 @@
+import numpy as np
+from pathlib import Path
+
+root = Path(r"C:\Users\danil\.vscode\grafy\dataset\StA")
+
+def summarize(cls):
+    files = sorted((root/cls).glob("*.npz"))[:50]
+    rows = []
+    for p in files:
+        d = np.load(p)
+        A = d["StA"].astype(np.float32)  # (3,L)
+        rows.append([
+            A.mean(), A.std(),
+            np.quantile(A, 0.05), np.quantile(A, 0.95),
+            A.min(), A.max()
+        ])
+    R = np.array(rows)
+    print("\n", cls, "N=", len(files))
+    print("mean(mean)=", R[:,0].mean())
+    print("mean(std) =", R[:,1].mean())
+    print("mean(q05) =", R[:,2].mean(), "mean(q95) =", R[:,3].mean())
+    print("global min =", R[:,4].min(), "global max =", R[:,5].max())
+
+summarize("3_1")
+summarize("4_1")
