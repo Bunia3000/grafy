@@ -1,0 +1,25 @@
+from pathlib import Path
+
+ROOT = Path(r"C:\Users\danil\.vscode\grafy\dataset\grafyzexela")
+OUTPUT_FILE = ROOT / "liczba_grafow.txt"
+
+total_graphs = 0
+lines = []
+
+for subdir in sorted(p for p in ROOT.iterdir() if p.is_dir()):
+    # liczymy tylko pliki (pomijamy ewentualne podfoldery)
+    files = [f for f in subdir.iterdir() if f.is_file()]
+    count = len(files)
+
+    lines.append(f"{subdir.name}: {count}")
+    total_graphs += count
+
+lines.append("-" * 30)
+lines.append(f"RAZEM: {total_graphs}")
+
+# zapis do pliku
+OUTPUT_FILE.write_text("\n".join(lines), encoding="utf-8")
+
+# wypisanie w konsoli
+print("\n".join(lines))
+print(f"\nZapisano raport do: {OUTPUT_FILE}")

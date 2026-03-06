@@ -1,0 +1,214 @@
+import re
+from pathlib import Path
+from typing import Optional, Tuple, List
+from datetime import datetime
+import pandas as pd
+import os
+
+
+EXCEL_PATH = r"C:\Users\danil\.vscode\grafy\dataset\100_results_run-2.xlsx"
+OUT_ROOT = Path(r"C:\Users\danil\.vscode\grafy\dataset\grafyzexela")
+
+TOPO_RE = re.compile(r"t(\d+_\d+)")
+FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d+|\d+\.|\.\d+|\d+)(?:[eE][-+]?\d+)?")
+
+SKIPPED_LOG_PATH = r"C:\Users\danil\.vscode\grafy\dataset\grafyzexela\skipped_rows.txt"
+
+
+def parse_graph_type_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = TOPO_RE.search(text)
+    return m.group(1) if m else None
+
+
+def parse_arc_points(text: str) -> list[tuple[float, float, float]]:
+    nums = [float(x) for x in FLOAT_RE.findall(text)]
+    if not nums:
+        return []
+    if len(nums) % 3 != 0:
+        raise ValueError(f"Arc: liczby={len(nums)} nie dzielą się przez 3. Początek: {text[:120]!r}")
+    return [(nums[i], nums[i + 1], nums[i + 2]) for i in range(0, len(nums), 3)]
+
+
+def write_xyz(out_path: Path, arcs: list[list[tuple[float, float, float]]]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        for edge_id, pts in enumerate(arcs):
+            for i, (x, y, z) in enumerate(pts):
+                f.write(f"{edge_id} {i} {x} {y} {z}\n")
+
+
+def row_to_text(row) -> str:
+    """
+    Łączy wszystkie komórki w wierszu w jeden string (odporne na brak kolumn).
+    """
+    parts = []
+    for v in row:
+        if v is None:
+            continue
+        if isinstance(v, float) and pd.isna(v):
+            continue
+        s = str(v).strip()
+        if s:
+            parts.append(s)
+    return " ".join(parts)
+
+
+def extract_arcs_from_row_text(row_text: str) -> Optional[Tuple[str, List[str]]]:
+    gtype = parse_graph_type_from_text(row_text)
+    if gtype is None:
+        return None
+
+    segs = [s.strip() for s in row_text.split("|") if s.strip()]
+
+    arc_candidates = []
+    for s in segs:
+        # heurystyka: łuk = bardzo dużo liczb (punkty 3D), zwykle z przecinkami
+        nums = FLOAT_RE.findall(s)
+        if len(nums) >= 60 and "," in s:
+            arc_candidates.append(s)
+
+    if len(arc_candidates) < 3:
+        return None
+
+    return gtype, arc_candidates[-3:]
+
+
+def log_skipped_row(log_path: str, reason: str, row_idx: int, row_text: str) -> None:
+    # Czyścimy nowe linie i taby, żeby faktycznie było 1-linijkowo.
+    compact = " ".join(str(row_text).replace("\t", " ").split())
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] row={row_idx} reason={reason} | {compact}\n"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def reset_log_file(log_path: str) -> None:
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("# Skipped rows log\n")
+
+
+
+'''
+def main():
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    reset_log_file(SKIPPED_LOG_PATH)
+
+
+    # Wczytaj cały arkusz "jak leci"
+    df = pd.read_excel(EXCEL_PATH, header=None)
+
+    counters: dict[str, int] = {}
+    written = 0
+    skipped = 0
+    errors = 0
+
+    for _, row in df.iterrows():
+        text = row_to_text(row)
+        if not text:
+            continue
+
+        extracted = extract_arcs_from_row_text(text)
+        if extracted is None:
+            skipped += 1
+            continue
+
+        gtype, arcs_text = extracted
+
+        try:
+            arc1 = parse_arc_points(arcs_text[0])
+            arc2 = parse_arc_points(arcs_text[1])
+            arc3 = parse_arc_points(arcs_text[2])
+        except Exception:
+            errors += 1
+            continue
+
+        if not arc1 or not arc2 or not arc3:
+            skipped += 1
+            continue
+
+        n = counters.get(gtype, 0) + 1
+        counters[gtype] = n
+
+        out_file = OUT_ROOT / gtype / f"{n}.xyz"
+        write_xyz(out_file, [arc1, arc2, arc3])
+        written += 1
+
+    print(f"Zapisano: {written} plików .xyz")
+    print(f"Pominięto: {skipped} wierszy (brak typu lub brak 3 arc)")
+    print(f"Błędy parsowania arc: {errors}")
+
+'''    
+
+def main():
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    reset_log_file(SKIPPED_LOG_PATH)
+
+    # Wczytaj cały arkusz "jak leci"
+    df = pd.read_excel(EXCEL_PATH, header=None)
+
+    counters: dict[str, int] = {}
+    written = 0
+    skipped = 0
+    errors = 0
+    empty = 0
+
+    for row_idx, row in df.iterrows():
+        text = row_to_text(row)
+        if not text:
+            empty += 1
+            log_skipped_row(SKIPPED_LOG_PATH, "empty_row_text", int(row_idx), "")
+            continue
+
+        extracted = extract_arcs_from_row_text(text)
+        if extracted is None:
+            skipped += 1
+            # tu przyczyny są 2: brak typu albo brak 3 łuków – rozbijmy je w logu
+            gtype = parse_graph_type_from_text(text)
+            if gtype is None:
+                log_skipped_row(SKIPPED_LOG_PATH, "no_graph_type_found", int(row_idx), text)
+            else:
+                log_skipped_row(SKIPPED_LOG_PATH, "less_than_3_arc_candidates", int(row_idx), text)
+            continue
+
+        gtype, arcs_text = extracted
+
+        try:
+            arc1 = parse_arc_points(arcs_text[0])
+            arc2 = parse_arc_points(arcs_text[1])
+            arc3 = parse_arc_points(arcs_text[2])
+        except Exception as e:
+            errors += 1
+            log_skipped_row(
+                SKIPPED_LOG_PATH,
+                f"arc_parse_exception:{type(e).__name__}:{e}",
+                int(row_idx),
+                text
+            )
+            continue
+
+        if not arc1 or not arc2 or not arc3:
+            skipped += 1
+            log_skipped_row(SKIPPED_LOG_PATH, "empty_arc_after_parse", int(row_idx), text)
+            continue
+
+        n = counters.get(gtype, 0) + 1
+        counters[gtype] = n
+
+        out_file = OUT_ROOT / gtype / f"{n}.xyz"
+        write_xyz(out_file, [arc1, arc2, arc3])
+        written += 1
+
+    print(f"Zapisano: {written} plików .xyz")
+    print(f"Pominięto: {skipped} wierszy (brak typu lub brak 3 arc / puste arc)")
+    print(f"Błędy parsowania arc: {errors}")
+    print(f"Puste wiersze: {empty}")
+    print(f"Log: {SKIPPED_LOG_PATH}")
+
+
+
+
+if __name__ == "__main__":
+    main()
